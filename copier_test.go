@@ -4,6 +4,7 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"reflect"
 	"testing"
 	"time"
 
@@ -26,9 +27,10 @@ func (user User) DoubleAge() int32 {
 }
 
 type Employee struct {
+	_User     *User
 	Name      string
 	Birthday  *time.Time
-	Nickname  *string
+	NickName  *string
 	Age       int64
 	FakeAge   int
 	EmployeID int64
@@ -46,7 +48,7 @@ func checkEmployee(employee Employee, user User, t *testing.T, testCase string) 
 	if employee.Name != user.Name {
 		t.Errorf("%v: Name haven't been copied correctly.", testCase)
 	}
-	if employee.Nickname == nil || *employee.Nickname != user.Nickname {
+	if employee.NickName == nil || *employee.NickName != user.Nickname {
 		t.Errorf("%v: NickName haven't been copied correctly.", testCase)
 	}
 	if employee.Birthday == nil && user.Birthday != nil {
@@ -100,7 +102,7 @@ func TestCopySameStructWithPointerField(t *testing.T) {
 
 func checkEmployee2(employee Employee, user *User, t *testing.T, testCase string) {
 	if user == nil {
-		if employee.Name != "" || employee.Nickname != nil || employee.Birthday != nil || employee.Age != 0 ||
+		if employee.Name != "" || employee.NickName != nil || employee.Birthday != nil || employee.Age != 0 ||
 			employee.DoubleAge != 0 || employee.FakeAge != 0 || employee.SuperRule != "" || employee.Notes != nil {
 			t.Errorf("%v : employee should be empty", testCase)
 		}
@@ -108,6 +110,18 @@ func checkEmployee2(employee Employee, user *User, t *testing.T, testCase string
 	}
 
 	checkEmployee(employee, *user, t, testCase)
+}
+
+func TestCopySliceOfDifferentTypes(t *testing.T) {
+	var ss []string
+	var is []int
+	if err := copier.Copy(&ss, is); err != nil {
+		t.Error(err)
+	}
+	var anotherSs []string
+	if !reflect.DeepEqual(ss, anotherSs) {
+		t.Errorf("Copy nil slice to nil slice should get nil slice")
+	}
 }
 
 func TestCopyStruct(t *testing.T) {
@@ -134,6 +148,10 @@ func TestCopyStruct(t *testing.T) {
 	employee4 := &Employee{}
 	copier.Copy(&employee4, user)
 	checkEmployee(*employee4, user, t, "Copy From Ptr To Double Ptr")
+
+	employee5 := &Employee{}
+	copier.Copy(&employee5, &employee)
+	checkEmployee(*employee5, user, t, "Copy From Employee To Employee")
 }
 
 func TestCopyFromStructToSlice(t *testing.T) {
@@ -173,7 +191,9 @@ func TestCopyFromStructToSlice(t *testing.T) {
 }
 
 func TestCopyFromSliceToSlice(t *testing.T) {
-	users := []User{{Name: "Jinzhu", Age: 18, Role: "Admin", Notes: []string{"hello world"}}, {Name: "Jinzhu2", Age: 22, Role: "Dev", Notes: []string{"hello world", "hello"}}}
+	users := []User{
+		{Name: "Jinzhu", Age: 18, Role: "Admin", Notes: []string{"hello world"}},
+		{Name: "Jinzhu2", Age: 22, Role: "Dev", Notes: []string{"hello world", "hello"}}}
 	employees := []Employee{}
 
 	if copier.Copy(&employees, users); len(employees) != 2 {
@@ -328,10 +348,14 @@ func TestStructField(t *testing.T) {
 	type UserWithDetailsPtr struct {
 		Details []*Detail
 		Detail  *Detail
+		Notes   *[]string
+		Notes2  *[]string
 	}
 	type UserWithDetails struct {
 		Details []Detail
 		Detail  Detail
+		Notes   []string
+		Notes2  []string
 	}
 	type UserWithSimilarDetailsPtr struct {
 		Detail *SimilarDetail
@@ -383,7 +407,7 @@ func TestStructField(t *testing.T) {
 				t.Fatalf("DeepCopy not enabled")
 			}
 
-			if len(to.Details) != len(to.Details) {
+			if len(from.Details) != len(to.Details) {
 				t.Fatalf("slice should be copied")
 			}
 
@@ -408,7 +432,7 @@ func TestStructField(t *testing.T) {
 				t.Fatalf("DeepCopy not enabled")
 			}
 
-			if len(to.Details) != len(to.Details) {
+			if len(from.Details) != len(to.Details) {
 				t.Fatalf("slice should be copied")
 			}
 
@@ -496,6 +520,27 @@ func TestStructField(t *testing.T) {
 				t.Errorf("should be different")
 			}
 		})
+
+		t.Run("Should work with from a nil ptr slice field to a slice field", func(t *testing.T) {
+			notes := []string{"hello", "world"}
+			from := UserWithDetailsPtr{Notes: &notes, Notes2: nil}
+			to := UserWithDetails{}
+			err := copier.Copy(&to, from)
+			if err != nil {
+				t.Errorf("should not return an error")
+				return
+			}
+
+			if len(to.Notes) != len(*from.Notes) {
+				t.Errorf("should be the same length")
+			}
+			if to.Notes[0] != (*from.Notes)[0] {
+				t.Errorf("should be the same")
+			}
+			if to.Notes[1] != (*from.Notes)[1] {
+				t.Errorf("should be the same")
+			}
+		})
 	})
 
 	t.Run("Should work with deepCopy", func(t *testing.T) {
@@ -515,7 +560,7 @@ func TestStructField(t *testing.T) {
 				t.Fatalf("DeepCopy enabled")
 			}
 
-			if len(to.Details) != len(to.Details) {
+			if len(from.Details) != len(to.Details) {
 				t.Fatalf("slice should be copied")
 			}
 
@@ -539,7 +584,7 @@ func TestStructField(t *testing.T) {
 				t.Fatalf("DeepCopy enabled")
 			}
 
-			if len(to.Details) != len(to.Details) {
+			if len(from.Details) != len(to.Details) {
 				t.Fatalf("slice should be copied")
 			}
 
@@ -624,6 +669,37 @@ func TestStructField(t *testing.T) {
 				t.Errorf("should be the same")
 			}
 			if to.Detail.Info2 == from.Detail.Info2 {
+				t.Errorf("should be different")
+			}
+		})
+
+		t.Run("Should work with from a nil ptr slice field to a slice field", func(t *testing.T) {
+			notes := []string{"hello", "world"}
+			from := UserWithDetailsPtr{Notes: &notes, Notes2: nil}
+			to := UserWithDetails{}
+			err := copier.CopyWithOption(&to, from, optionsDeepCopy)
+			if err != nil {
+				t.Errorf("should not return an error")
+				return
+			}
+
+			if len(to.Notes) != len(*from.Notes) {
+				t.Errorf("should be the same length")
+			}
+			if to.Notes[0] != (*from.Notes)[0] {
+				t.Errorf("should be the same")
+			}
+			if to.Notes[1] != (*from.Notes)[1] {
+				t.Errorf("should be the same")
+			}
+
+			newValue := []string{"new", "value"}
+			to.Notes = newValue
+
+			if to.Notes[0] == (*from.Notes)[0] {
+				t.Errorf("should be different")
+			}
+			if to.Notes[1] == (*from.Notes)[1] {
 				t.Errorf("should be different")
 			}
 		})
@@ -724,7 +800,7 @@ func TestMapInterface(t *testing.T) {
 
 	t.Run("Test copy map with nested slice map", func(t *testing.T) {
 		var out map[string]interface{}
-		var value = map[string]interface{}{
+		value := map[string]interface{}{
 			"list": []map[string]interface{}{
 				{
 					"shop_id": 123,
@@ -1025,6 +1101,36 @@ func TestAnonymousFields(t *testing.T) {
 		}
 	})
 
+	t.Run("Should work with exported ptr fields with same name src field", func(t *testing.T) {
+		type Nested struct {
+			A string
+		}
+		type parentA struct {
+			A string
+		}
+		type parentB struct {
+			*Nested
+		}
+
+		fieldValue := "a"
+		from := parentA{A: fieldValue}
+		to := parentB{}
+
+		err := copier.CopyWithOption(&to, &from, copier.Option{
+			DeepCopy: true,
+		})
+		if err != nil {
+			t.Errorf("Unexpected error: %v", err)
+			return
+		}
+
+		from.A = "b"
+
+		if to.Nested.A != fieldValue {
+			t.Errorf("should not change")
+		}
+	})
+
 	t.Run("Should work with exported fields", func(t *testing.T) {
 		type Nested struct {
 			A string
@@ -1138,6 +1244,108 @@ func TestCopyMapOfInt(t *testing.T) {
 	}
 }
 
+func TestCopyMapOfSliceValue(t *testing.T) {
+	// case1: map's value is a simple slice
+	key, value := 2, 3
+	src := map[int][]int{key: {value}}
+
+	dst1 := map[int][]int{}
+	var dst2 map[int][]int
+	err := copier.Copy(&dst1, src)
+	if err != nil {
+		t.Error("Should not raise error")
+	}
+	err = copier.Copy(&dst2, src)
+	if err != nil {
+		t.Error("Should not raise error")
+	}
+
+	for k, v1 := range src {
+		v2, ok := dst1[k]
+		if !ok || len(v1) != len(v2) || k != key {
+			t.Errorf("Map should be copied")
+		}
+		for i := range v1 {
+			if v2[i] != value {
+				t.Errorf("Map's slice value shoud be copied")
+			}
+		}
+
+		v3, ok := dst2[k]
+		if !ok || len(v1) != len(v3) {
+			t.Errorf("Map should be copied")
+		}
+		for i := range v1 {
+			if v3[i] != value {
+				t.Errorf("Map's slice value shoud be copied")
+			}
+		}
+	}
+
+	// case2: map's value is a slice whose element is map
+	key1, key2 := 2, 3
+	value = 4
+	s := map[int][]map[int]int{key1: {{key2: value}}}
+	d1 := map[int][]map[int]int{key1: {{key1: key2}}}
+	d2 := map[int][]map[int]int{key1: {}}
+	d3 := map[int][]map[int]int{key1: nil}
+	d4 := map[int][]map[int]int{}
+	d5 := map[int][]map[int]int(nil)
+	ms := []map[int][]map[int]int{d1, d2, d3, d4, d5}
+	for i := range ms {
+		copier.CopyWithOption(&ms[i], s, copier.Option{IgnoreEmpty: false, DeepCopy: true})
+
+		if len(ms[i]) != len(s) {
+			t.Errorf("Number of map's keys should be equal")
+		}
+		for k, sliceMap := range ms[i] {
+			if k != key1 {
+				t.Errorf("Map's key should be copied")
+			}
+			if len(sliceMap) != len(s[key1]) || len(sliceMap) != 1 {
+				t.Errorf("Map's slice value should be copied")
+			}
+			m := sliceMap[0]
+			if len(m) != len(s[key1][0]) || len(m) != 1 {
+				t.Errorf("Map's slice value should be copied recursively")
+			}
+			for k, v := range m {
+				if k != key2 || v != value {
+					t.Errorf("Map's slice value should be copied recursively")
+				}
+			}
+		}
+	}
+}
+
+func TestCopyMapOfPtrValue(t *testing.T) {
+	intV := 3
+	intv := intV
+	src := map[int]*int{2: &intv}
+	dst1 := map[int]*int{}
+	var dst2 map[int]*int
+	err := copier.Copy(&dst1, src)
+	if err != nil {
+		t.Error("Should not raise error")
+	}
+	err = copier.Copy(&dst2, src)
+	if err != nil {
+		t.Error("Should not raise error")
+	}
+
+	for k, v1 := range src {
+		v2, ok := dst1[k]
+		if !ok || v2 == nil || v1 == nil || *v2 != *v1 || *v2 != intV {
+			t.Errorf("Map should be copied")
+		}
+
+		v3, ok := dst2[k]
+		if !ok || v3 == nil || *v3 != *v1 || *v3 != intV {
+			t.Errorf("Map should be copied")
+		}
+	}
+}
+
 func TestCopyWithOption(t *testing.T) {
 	from := structSameName2{D: "456", E: &someStruct{IntField: 100, UIntField: 1000}}
 	to := &structSameName1{A: "123", B: 2, C: time.Now(), D: "123", E: &someStruct{UIntField: 5000}}
@@ -1188,22 +1396,23 @@ func TestScanner(t *testing.T) {
 }
 
 func TestScanFromPtrToSqlNullable(t *testing.T) {
-
 	var (
 		from struct {
-			S    string
-			Sptr *string
-			T1   sql.NullTime
-			T2   sql.NullTime
-			T3   *time.Time
+			S     string
+			Sptr  *string
+			Snull sql.NullString
+			T1    sql.NullTime
+			T2    sql.NullTime
+			T3    *time.Time
 		}
 
 		to struct {
-			S    sql.NullString
-			Sptr sql.NullString
-			T1   time.Time
-			T2   *time.Time
-			T3   sql.NullTime
+			S     sql.NullString
+			Sptr  sql.NullString
+			Snull *string
+			T1    time.Time
+			T2    *time.Time
+			T3    sql.NullTime
 		}
 
 		s string
@@ -1228,8 +1437,12 @@ func TestScanFromPtrToSqlNullable(t *testing.T) {
 		t.Errorf("to.T1 should be Zero but %v", to.T1)
 	}
 
-	if to.T2 != nil && !to.T2.IsZero() {
-		t.Errorf("to.T2 should be Zero but %v", to.T2)
+	if to.T2 != nil {
+		t.Errorf("to.T2 should be nil but %v", to.T2)
+	}
+
+	if to.Snull != nil {
+		t.Errorf("to.Snull should be nil but %v", to.Snull)
 	}
 
 	now := time.Now()
@@ -1260,7 +1473,7 @@ func TestScanFromPtrToSqlNullable(t *testing.T) {
 }
 
 func TestDeepCopyInterface(t *testing.T) {
-	var m = make(map[string]string)
+	m := make(map[string]string)
 	m["a"] = "ccc"
 
 	from := []interface{}{[]int{7, 8, 9}, 2, 3, m, errors.New("aaaa")}
@@ -1285,5 +1498,279 @@ func TestDeepCopyInterface(t *testing.T) {
 
 	if to[3].(map[string]string)["a"] != "ccc" {
 		t.Errorf("to value failed to be deep copied")
+	}
+}
+
+func TestDeepCopyTime(t *testing.T) {
+	type embedT1 struct {
+		T5 time.Time
+	}
+
+	type embedT2 struct {
+		T6 *time.Time
+	}
+
+	var (
+		from struct {
+			T1 time.Time
+			T2 *time.Time
+
+			T3 *time.Time
+			T4 time.Time
+			T5 time.Time
+			T6 time.Time
+		}
+
+		to struct {
+			T1 time.Time
+			T2 *time.Time
+
+			T3 time.Time
+			T4 *time.Time
+			embedT1
+			embedT2
+		}
+	)
+
+	t1 := time.Now()
+	from.T1 = t1
+	t2 := t1.Add(time.Second)
+	from.T2 = &t2
+	t3 := t2.Add(time.Second)
+	from.T3 = &t3
+	t4 := t3.Add(time.Second)
+	from.T4 = t4
+	t5 := t4.Add(time.Second)
+	from.T5 = t5
+	t6 := t5.Add(time.Second)
+	from.T6 = t6
+
+	err := copier.CopyWithOption(&to, from, copier.Option{DeepCopy: true})
+	if err != nil {
+		t.Error("Should not raise error")
+	}
+
+	if !to.T1.Equal(from.T1) {
+		t.Errorf("Field T1 should be copied")
+	}
+	if !to.T2.Equal(*from.T2) {
+		t.Errorf("Field T2 should be copied")
+	}
+	if !to.T3.Equal(*from.T3) {
+		t.Errorf("Field T3 should be copied")
+	}
+	if !to.T4.Equal(from.T4) {
+		t.Errorf("Field T4 should be copied")
+	}
+	if !to.T5.Equal(from.T5) {
+		t.Errorf("Field T5 should be copied")
+	}
+	if !to.T6.Equal(from.T6) {
+		t.Errorf("Field T6 should be copied")
+	}
+}
+
+func TestNestedPrivateData(t *testing.T) {
+	type hasPrivate struct {
+		data int
+	}
+
+	type hasMembers struct {
+		Member hasPrivate
+	}
+
+	src := hasMembers{
+		Member: hasPrivate{
+			data: 42,
+		},
+	}
+	var shallow hasMembers
+	err := copier.Copy(&shallow, &src)
+	if err != nil {
+		t.Errorf("could not complete shallow copy")
+	}
+	if !reflect.DeepEqual(&src, &shallow) {
+		t.Errorf("shallow copy faild")
+	}
+
+	var deep hasMembers
+	err = copier.CopyWithOption(&deep, &src, copier.Option{DeepCopy: true})
+	if err != nil {
+		t.Errorf("could not complete deep copy")
+	}
+	if !reflect.DeepEqual(&src, &deep) {
+		t.Errorf("deep copy faild")
+	}
+
+	if !reflect.DeepEqual(&shallow, &deep) {
+		t.Errorf("unexpected difference between shallow and deep copy")
+	}
+}
+
+func TestDeepMapCopyTime(t *testing.T) {
+	t1 := time.Now()
+	t2 := t1.Add(time.Second)
+	from := []map[string]interface{}{
+		{
+			"t1": t1,
+			"t2": &t2,
+		},
+	}
+	to := make([]map[string]interface{}, len(from))
+
+	err := copier.CopyWithOption(&to, from, copier.Option{DeepCopy: true})
+	if err != nil {
+		t.Error("should not error")
+	}
+	if len(to) != len(from) {
+		t.Errorf("slice should be copied")
+	}
+	if !to[0]["t1"].(time.Time).Equal(from[0]["t1"].(time.Time)) {
+		t.Errorf("nested time ptr should be copied")
+	}
+	if !to[0]["t2"].(*time.Time).Equal(*from[0]["t2"].(*time.Time)) {
+		t.Errorf("nested time ptr should be copied")
+	}
+}
+
+func TestCopySimpleTime(t *testing.T) {
+	from := time.Now()
+	to := time.Time{}
+
+	err := copier.Copy(&to, from)
+	if err != nil {
+		t.Error("should not error")
+	}
+	if !from.Equal(to) {
+		t.Errorf("to (%v) value should equal from (%v) value", to, from)
+	}
+}
+
+func TestDeepCopySimpleTime(t *testing.T) {
+	from := time.Now()
+	to := time.Time{}
+
+	err := copier.CopyWithOption(&to, from, copier.Option{DeepCopy: true})
+	if err != nil {
+		t.Error("should not error")
+	}
+	if !from.Equal(to) {
+		t.Errorf("to (%v) value should equal from (%v) value", to, from)
+	}
+}
+
+type TimeWrapper struct {
+	time.Time
+}
+
+func TestDeepCopyAnonymousFieldTime(t *testing.T) {
+	from := TimeWrapper{time.Now()}
+	to := TimeWrapper{}
+
+	err := copier.CopyWithOption(&to, from, copier.Option{DeepCopy: true})
+	if err != nil {
+		t.Error("should not error")
+	}
+	if !from.Time.Equal(to.Time) {
+		t.Errorf("to (%v) value should equal from (%v) value", to.Time, from.Time)
+	}
+}
+
+func TestSqlNullFiled(t *testing.T) {
+
+	type sqlStruct struct {
+		MkId              sql.NullInt64
+		MkExpiryDateType  sql.NullInt32
+		MkExpiryDateStart sql.NullString
+	}
+
+	type dataStruct struct {
+		MkId              int64
+		MkExpiryDateType  int32
+		MkExpiryDateStart string
+	}
+
+	from := sqlStruct{
+		MkId:              sql.NullInt64{Int64: 3, Valid: true},
+		MkExpiryDateType:  sql.NullInt32{Int32: 4, Valid: true},
+		MkExpiryDateStart: sql.NullString{String: "5", Valid: true},
+	}
+
+	to := dataStruct{}
+
+	err := copier.Copy(&to, from)
+	if err != nil {
+		t.Error("should not error")
+	}
+	if from.MkId.Int64 != to.MkId {
+		t.Errorf("to (%v) value should equal from (%v) value", to.MkId, from.MkId.Int64)
+	}
+
+	if from.MkExpiryDateStart.String != to.MkExpiryDateStart {
+		t.Errorf("to (%v) value should equal from (%v) value", to.MkExpiryDateStart, from.MkExpiryDateStart.String)
+	}
+
+	if from.MkExpiryDateType.Int32 != to.MkExpiryDateType {
+		t.Errorf("to (%v) value should equal from (%v) value", to.MkExpiryDateType, from.MkExpiryDateType.Int32)
+	}
+}
+
+func TestEmptySlice(t *testing.T) {
+	type Str1 string
+	type Str2 string
+	type Input1 struct {
+		Val Str1
+	}
+	type Input2 struct {
+		Val Str2
+	}
+	to := []*Input1(nil)
+	from := []*Input2{}
+	err := copier.Copy(&to, &from)
+	if err != nil {
+		t.Error("should not error")
+	}
+	if from == nil {
+		t.Error("from should be empty slice not nil")
+	}
+
+	to = []*Input1(nil)
+	from = []*Input2(nil)
+	err = copier.Copy(&to, &from)
+	if err != nil {
+		t.Error("should not error")
+	}
+	if from != nil {
+		t.Error("from should be empty slice nil")
+	}
+}
+
+func TestNestedNilPointerStruct(t *testing.T) {
+	type destination struct {
+		Title string
+	}
+
+	type NestedSource struct {
+		ID int
+	}
+
+	type source struct {
+		Title string
+		*NestedSource
+	}
+
+	from := &source{
+		Title: "A title to be copied",
+	}
+
+	to := destination{}
+
+	err := copier.Copy(&to, from)
+	if err != nil {
+		t.Error("should not error")
+	}
+
+	if from.Title != to.Title {
+		t.Errorf("to (%v) value should equal from (%v) value", to.Title, from.Title)
 	}
 }

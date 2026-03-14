@@ -3,10 +3,10 @@ package copier
 import (
 	"database/sql"
 	"database/sql/driver"
-	"errors"
 	"fmt"
 	"reflect"
 	"strings"
+	"sync"
 	"unicode"
 )
 
@@ -22,16 +22,84 @@ const (
 	// Ignore a destination field from being copied to.
 	tagIgnore
 
+	// Denotes the fact that the field should be overridden, no matter if the IgnoreEmpty is set
+	tagOverride
+
 	// Denotes that the value as been copied
 	hasCopied
+
+	// Some default converter types for a nicer syntax
+	String  string  = ""
+	Bool    bool    = false
+	Int     int     = 0
+	Float32 float32 = 0
+	Float64 float64 = 0
 )
 
 // Option sets copy options
 type Option struct {
 	// setting this value to true will ignore copying zero values of all the fields, including bools, as well as a
 	// struct having all it's fields set to their zero values respectively (see IsZero() in reflect/value.go)
-	IgnoreEmpty bool
-	DeepCopy    bool
+	IgnoreEmpty   bool
+	CaseSensitive bool
+	DeepCopy      bool
+	Converters    []TypeConverter
+	// Custom field name mappings to copy values with different names in `fromValue` and `toValue` types.
+	// Examples can be found in `copier_field_name_mapping_test.go`.
+	FieldNameMapping []FieldNameMapping
+	// When set to true, all fields will be treated as if they have the "must" tag
+	Must bool
+	// When set to true, all fields will be treated as if they have the "nopanic" tag.
+	// This only has an effect when Must is also true
+	NoPanic bool
+}
+
+func (opt Option) converters() map[converterPair]TypeConverter {
+	var converters = map[converterPair]TypeConverter{}
+
+	// save converters into map for faster lookup
+	for i := range opt.Converters {
+		pair := converterPair{
+			SrcType: reflect.TypeOf(opt.Converters[i].SrcType),
+			DstType: reflect.TypeOf(opt.Converters[i].DstType),
+		}
+
+		converters[pair] = opt.Converters[i]
+	}
+
+	return converters
+}
+
+type TypeConverter struct {
+	SrcType interface{}
+	DstType interface{}
+	Fn      func(src interface{}) (dst interface{}, err error)
+}
+
+type converterPair struct {
+	SrcType reflect.Type
+	DstType reflect.Type
+}
+
+func (opt Option) fieldNameMapping() map[converterPair]FieldNameMapping {
+	var mapping = map[converterPair]FieldNameMapping{}
+
+	for i := range opt.FieldNameMapping {
+		pair := converterPair{
+			SrcType: reflect.TypeOf(opt.FieldNameMapping[i].SrcType),
+			DstType: reflect.TypeOf(opt.FieldNameMapping[i].DstType),
+		}
+
+		mapping[pair] = opt.FieldNameMapping[i]
+	}
+
+	return mapping
+}
+
+type FieldNameMapping struct {
+	SrcType interface{}
+	DstType interface{}
+	Mapping map[string]string
 }
 
 // Tag Flags
@@ -59,10 +127,12 @@ func CopyWithOption(toValue interface{}, fromValue interface{}, opt Option) (err
 
 func copier(toValue interface{}, fromValue interface{}, opt Option) (err error) {
 	var (
-		isSlice bool
-		amount  = 1
-		from    = indirect(reflect.ValueOf(fromValue))
-		to      = indirect(reflect.ValueOf(toValue))
+		isSlice    bool
+		amount     = 1
+		from       = indirect(reflect.ValueOf(fromValue))
+		to         = indirect(reflect.ValueOf(toValue))
+		converters = opt.converters()
+		mappings   = opt.fieldNameMapping()
 	)
 
 	if !to.CanAddr() {
@@ -113,13 +183,24 @@ func copier(toValue interface{}, fromValue interface{}, opt Option) (err error) 
 
 		for _, k := range from.MapKeys() {
 			toKey := indirect(reflect.New(toType.Key()))
-			if !set(toKey, k, opt.DeepCopy) {
+			isSet, err := set(toKey, k, opt.DeepCopy, converters)
+			if err != nil {
+				return err
+			}
+			if !isSet {
 				return fmt.Errorf("%w map, old key: %v, new key: %v", ErrNotSupported, k.Type(), toType.Key())
 			}
 
-			elemType, _ := indirectType(toType.Elem())
+			elemType := toType.Elem()
+			if elemType.Kind() != reflect.Slice {
+				elemType, _ = indirectType(elemType)
+			}
 			toValue := indirect(reflect.New(elemType))
-			if !set(toValue, from.MapIndex(k), opt.DeepCopy) {
+			isSet, err = set(toValue, from.MapIndex(k), opt.DeepCopy, converters)
+			if err != nil {
+				return err
+			}
+			if !isSet {
 				if err = copier(toValue.Addr().Interface(), from.MapIndex(k).Interface(), opt); err != nil {
 					return err
 				}
@@ -137,31 +218,51 @@ func copier(toValue interface{}, fromValue interface{}, opt Option) (err error) 
 		return
 	}
 
-	if from.Kind() == reflect.Slice && to.Kind() == reflect.Slice && fromType.ConvertibleTo(toType) {
+	if from.Kind() == reflect.Slice && to.Kind() == reflect.Slice {
+		// Return directly if both slices are nil
+		if from.IsNil() && to.IsNil() {
+			return
+		}
 		if to.IsNil() {
 			slice := reflect.MakeSlice(reflect.SliceOf(to.Type().Elem()), from.Len(), from.Cap())
 			to.Set(slice)
 		}
-
-		for i := 0; i < from.Len(); i++ {
-			if to.Len() < i+1 {
-				to.Set(reflect.Append(to, reflect.New(to.Type().Elem()).Elem()))
-			}
-
-			if !set(to.Index(i), from.Index(i), opt.DeepCopy) {
-				// ignore error while copy slice element
-				err = copier(to.Index(i).Addr().Interface(), from.Index(i).Interface(), opt)
+		if fromType.ConvertibleTo(toType) {
+			for i := 0; i < from.Len(); i++ {
+				if to.Len() < i+1 {
+					to.Set(reflect.Append(to, reflect.New(to.Type().Elem()).Elem()))
+				}
+				isSet, err := set(to.Index(i), from.Index(i), opt.DeepCopy, converters)
 				if err != nil {
-					continue
+					return err
+				}
+				if !isSet {
+					// ignore error while copy slice element
+					err = copier(to.Index(i).Addr().Interface(), from.Index(i).Interface(), opt)
+					if err != nil {
+						continue
+					}
 				}
 			}
+
+			if to.Len() > from.Len() {
+				to.SetLen(from.Len())
+			}
+
+			return
 		}
-		return
 	}
 
 	if fromType.Kind() != reflect.Struct || toType.Kind() != reflect.Struct {
 		// skip not supported type
 		return
+	}
+
+	if len(converters) > 0 {
+		if ok, e := set(to, from, opt.DeepCopy, converters); e == nil && ok {
+			// converter supported
+			return
+		}
 	}
 
 	if from.Kind() == reflect.Slice || to.Kind() == reflect.Slice {
@@ -188,6 +289,27 @@ func copier(toValue interface{}, fromValue interface{}, opt Option) (err error) 
 			dest = indirect(to)
 		}
 
+		if len(converters) > 0 {
+			if ok, e := set(dest, source, opt.DeepCopy, converters); e == nil && ok {
+				if isSlice {
+					// FIXME: maybe should check the other types?
+					if to.Type().Elem().Kind() == reflect.Ptr {
+						to.Index(i).Set(dest.Addr())
+					} else {
+						if to.Len() < i+1 {
+							reflect.Append(to, dest)
+						} else {
+							to.Index(i).Set(dest)
+						}
+					}
+				} else {
+					to.Set(dest)
+				}
+
+				continue
+			}
+		}
+
 		destKind := dest.Kind()
 		initDest := false
 		if destKind == reflect.Interface {
@@ -195,33 +317,39 @@ func copier(toValue interface{}, fromValue interface{}, opt Option) (err error) 
 			dest = indirect(reflect.New(toType))
 		}
 
-		// Get tag options
-		flgs, err := getFlags(dest, source, toType, fromType)
+		var flgs flags
+		flgs, err = getFlags(dest, source, toType, fromType, opt)
 		if err != nil {
 			return err
 		}
 
 		// check source
 		if source.IsValid() {
+			copyUnexportedStructFields(dest, source)
+
 			// Copy from source field to dest field or method
 			fromTypeFields := deepFields(fromType)
 			for _, field := range fromTypeFields {
 				name := field.Name
 
 				// Get bit flags for field
-				fieldFlags, _ := flgs.BitFlags[name]
+				fieldFlags := flgs.BitFlags[name]
 
 				// Check if we should ignore copying
 				if (fieldFlags & tagIgnore) != 0 {
 					continue
 				}
 
-				srcFieldName, destFieldName := getFieldName(name, flgs)
-				if fromField := source.FieldByName(srcFieldName); fromField.IsValid() && !shouldIgnore(fromField, opt.IgnoreEmpty) {
+				fieldNamesMapping := getFieldNamesMapping(mappings, fromType, toType)
+
+				srcFieldName, destFieldName := getFieldName(name, flgs, fieldNamesMapping)
+
+				if fromField := fieldByNameOrZeroValue(source, srcFieldName); fromField.IsValid() && !shouldIgnore(fromField, fieldFlags, opt.IgnoreEmpty) {
 					// process for nested anonymous field
 					destFieldNotSet := false
 					if f, ok := dest.Type().FieldByName(destFieldName); ok {
-						for idx := range f.Index {
+						// only initialize parent embedded struct pointer in the path
+						for idx := range f.Index[:len(f.Index)-1] {
 							destField := dest.FieldByIndex(f.Index[:idx+1])
 
 							if destField.Kind() != reflect.Ptr {
@@ -246,10 +374,14 @@ func copier(toValue interface{}, fromValue interface{}, opt Option) (err error) 
 						break
 					}
 
-					toField := dest.FieldByName(destFieldName)
+					toField := fieldByName(dest, destFieldName, opt.CaseSensitive)
 					if toField.IsValid() {
 						if toField.CanSet() {
-							if !set(toField, fromField, opt.DeepCopy) {
+							isSet, err := set(toField, fromField, opt.DeepCopy, converters)
+							if err != nil {
+								return err
+							}
+							if !isSet {
 								if err := copier(toField.Addr().Interface(), fromField.Interface(), opt); err != nil {
 									return err
 								}
@@ -278,7 +410,7 @@ func copier(toValue interface{}, fromValue interface{}, opt Option) (err error) 
 			// Copy from from method to dest field
 			for _, field := range deepFields(toType) {
 				name := field.Name
-				srcFieldName, destFieldName := getFieldName(name, flgs)
+				srcFieldName, destFieldName := getFieldName(name, flgs, getFieldNamesMapping(mappings, fromType, toType))
 
 				var fromMethod reflect.Value
 				if source.CanAddr() {
@@ -287,11 +419,11 @@ func copier(toValue interface{}, fromValue interface{}, opt Option) (err error) 
 					fromMethod = source.MethodByName(srcFieldName)
 				}
 
-				if fromMethod.IsValid() && fromMethod.Type().NumIn() == 0 && fromMethod.Type().NumOut() == 1 && !shouldIgnore(fromMethod, opt.IgnoreEmpty) {
-					if toField := dest.FieldByName(destFieldName); toField.IsValid() && toField.CanSet() {
+				if fromMethod.IsValid() && fromMethod.Type().NumIn() == 0 && fromMethod.Type().NumOut() == 1 && !shouldIgnore(fromMethod, flgs.BitFlags[name], opt.IgnoreEmpty) {
+					if toField := fieldByName(dest, destFieldName, opt.CaseSensitive); toField.IsValid() && toField.CanSet() {
 						values := fromMethod.Call([]reflect.Value{})
 						if len(values) >= 1 {
-							set(toField, values[0], opt.DeepCopy)
+							set(toField, values[0], opt.DeepCopy, converters)
 						}
 					}
 				}
@@ -303,7 +435,11 @@ func copier(toValue interface{}, fromValue interface{}, opt Option) (err error) 
 				if to.Len() < i+1 {
 					to.Set(reflect.Append(to, dest.Addr()))
 				} else {
-					if !set(to.Index(i), dest.Addr(), opt.DeepCopy) {
+					isSet, err := set(to.Index(i), dest.Addr(), opt.DeepCopy, converters)
+					if err != nil {
+						return err
+					}
+					if !isSet {
 						// ignore error while copy slice element
 						err = copier(to.Index(i).Addr().Interface(), dest.Addr().Interface(), opt)
 						if err != nil {
@@ -315,7 +451,11 @@ func copier(toValue interface{}, fromValue interface{}, opt Option) (err error) 
 				if to.Len() < i+1 {
 					to.Set(reflect.Append(to, dest))
 				} else {
-					if !set(to.Index(i), dest, opt.DeepCopy) {
+					isSet, err := set(to.Index(i), dest, opt.DeepCopy, converters)
+					if err != nil {
+						return err
+					}
+					if !isSet {
 						// ignore error while copy slice element
 						err = copier(to.Index(i).Addr().Interface(), dest.Interface(), opt)
 						if err != nil {
@@ -334,31 +474,87 @@ func copier(toValue interface{}, fromValue interface{}, opt Option) (err error) 
 	return
 }
 
-func shouldIgnore(v reflect.Value, ignoreEmpty bool) bool {
-	if !ignoreEmpty {
-		return false
-	}
+func getFieldNamesMapping(mappings map[converterPair]FieldNameMapping, fromType reflect.Type, toType reflect.Type) map[string]string {
+	var fieldNamesMapping map[string]string
 
-	return v.IsZero()
+	if len(mappings) > 0 {
+		pair := converterPair{
+			SrcType: fromType,
+			DstType: toType,
+		}
+		if v, ok := mappings[pair]; ok {
+			fieldNamesMapping = v.Mapping
+		}
+	}
+	return fieldNamesMapping
 }
 
+func fieldByNameOrZeroValue(source reflect.Value, fieldName string) (value reflect.Value) {
+	defer func() {
+		if err := recover(); err != nil {
+			value = reflect.Value{}
+		}
+	}()
+
+	return source.FieldByName(fieldName)
+}
+
+func copyUnexportedStructFields(to, from reflect.Value) {
+	if from.Kind() != reflect.Struct || to.Kind() != reflect.Struct || !from.Type().AssignableTo(to.Type()) {
+		return
+	}
+
+	// create a shallow copy of 'to' to get all fields
+	tmp := indirect(reflect.New(to.Type()))
+	tmp.Set(from)
+
+	// revert exported fields
+	for i := 0; i < to.NumField(); i++ {
+		if tmp.Field(i).CanSet() {
+			tmp.Field(i).Set(to.Field(i))
+		}
+	}
+	to.Set(tmp)
+}
+
+func shouldIgnore(v reflect.Value, bitFlags uint8, ignoreEmpty bool) bool {
+	return ignoreEmpty && bitFlags&tagOverride == 0 && v.IsZero()
+}
+
+var deepFieldsLock sync.RWMutex
+var deepFieldsMap = make(map[reflect.Type][]reflect.StructField)
+
 func deepFields(reflectType reflect.Type) []reflect.StructField {
+	deepFieldsLock.RLock()
+	cache, ok := deepFieldsMap[reflectType]
+	deepFieldsLock.RUnlock()
+	if ok {
+		return cache
+	}
+	var res []reflect.StructField
 	if reflectType, _ = indirectType(reflectType); reflectType.Kind() == reflect.Struct {
 		fields := make([]reflect.StructField, 0, reflectType.NumField())
 
 		for i := 0; i < reflectType.NumField(); i++ {
 			v := reflectType.Field(i)
-			if v.Anonymous {
-				fields = append(fields, deepFields(v.Type)...)
-			} else {
+			// PkgPath is the package path that qualifies a lower case (unexported)
+			// field name. It is empty for upper case (exported) field names.
+			// See https://golang.org/ref/spec#Uniqueness_of_identifiers
+			if v.PkgPath == "" {
 				fields = append(fields, v)
+				if v.Anonymous {
+					// also consider fields of anonymous fields as fields of the root
+					fields = append(fields, deepFields(v.Type)...)
+				}
 			}
 		}
-
-		return fields
+		res = fields
 	}
 
-	return nil
+	deepFieldsLock.Lock()
+	deepFieldsMap[reflectType] = res
+	deepFieldsLock.Unlock()
+	return res
 }
 
 func indirect(reflectValue reflect.Value) reflect.Value {
@@ -376,89 +572,144 @@ func indirectType(reflectType reflect.Type) (_ reflect.Type, isPtr bool) {
 	return reflectType, isPtr
 }
 
-func set(to, from reflect.Value, deepCopy bool) bool {
-	if from.IsValid() {
-		if to.Kind() == reflect.Ptr {
-			// set `to` to nil if from is nil
-			if from.Kind() == reflect.Ptr && from.IsNil() {
-				to.Set(reflect.Zero(to.Type()))
-				return true
-			} else if to.IsNil() {
-				// `from`         -> `to`
-				// sql.NullString -> *string
-				if fromValuer, ok := driverValuer(from); ok {
-					v, err := fromValuer.Value()
-					if err != nil {
-						return false
-					}
-					// if `from` is not valid do nothing with `to`
-					if v == nil {
-						return true
-					}
-				}
-				// allocate new `to` variable with default value (eg. *string -> new(string))
-				to.Set(reflect.New(to.Type().Elem()))
-			}
-			// depointer `to`
-			to = to.Elem()
-		}
+func set(to, from reflect.Value, deepCopy bool, converters map[converterPair]TypeConverter) (bool, error) {
+	if !from.IsValid() {
+		return true, nil
+	}
+	if ok, err := lookupAndCopyWithConverter(to, from, converters); err != nil {
+		return false, err
+	} else if ok {
+		return true, nil
+	}
 
-		if deepCopy {
-			toKind := to.Kind()
-			if toKind == reflect.Interface && to.IsNil() {
-				if reflect.TypeOf(from.Interface()) != nil {
-					to.Set(reflect.New(reflect.TypeOf(from.Interface())).Elem())
-					toKind = reflect.TypeOf(to.Interface()).Kind()
-				}
-			}
-			if toKind == reflect.Struct || toKind == reflect.Map || toKind == reflect.Slice {
-				return false
-			}
-		}
-
-		if from.Type().ConvertibleTo(to.Type()) {
-			to.Set(from.Convert(to.Type()))
-		} else if toScanner, ok := to.Addr().Interface().(sql.Scanner); ok {
-			// `from`  -> `to`
-			// *string -> sql.NullString
-			if from.Kind() == reflect.Ptr {
-				// if `from` is nil do nothing with `to`
-				if from.IsNil() {
-					return true
-				}
-				// depointer `from`
-				from = indirect(from)
-			}
-			// `from` -> `to`
-			// string -> sql.NullString
-			// set `to` by invoking method Scan(`from`)
-			err := toScanner.Scan(from.Interface())
-			if err != nil {
-				return false
-			}
-		} else if fromValuer, ok := driverValuer(from); ok {
+	if to.Kind() == reflect.Ptr {
+		// set `to` to nil if from is nil
+		if from.Kind() == reflect.Ptr && from.IsNil() {
+			to.Set(reflect.Zero(to.Type()))
+			return true, nil
+		} else if to.IsNil() {
 			// `from`         -> `to`
-			// sql.NullString -> string
-			v, err := fromValuer.Value()
-			if err != nil {
-				return false
+			// sql.NullString -> *string
+			if fromValuer, ok := driverValuer(from); ok {
+				v, err := fromValuer.Value()
+				if err != nil {
+					return true, nil
+				}
+				// if `from` is not valid do nothing with `to`
+				if v == nil {
+					return true, nil
+				}
 			}
-			// if `from` is not valid do nothing with `to`
-			if v == nil {
-				return true
+			// allocate new `to` variable with default value (eg. *string -> new(string))
+			to.Set(reflect.New(to.Type().Elem()))
+		} else if from.Kind() != reflect.Ptr && from.IsZero() {
+			to.Set(reflect.Zero(to.Type()))
+			return true, nil
+		}
+		// depointer `to`
+		to = to.Elem()
+	}
+
+	if deepCopy {
+		toKind := to.Kind()
+		if toKind == reflect.Interface && to.IsNil() {
+			if reflect.TypeOf(from.Interface()) != nil {
+				to.Set(reflect.New(reflect.TypeOf(from.Interface())).Elem())
+				toKind = reflect.TypeOf(to.Interface()).Kind()
 			}
-			rv := reflect.ValueOf(v)
-			if rv.Type().AssignableTo(to.Type()) {
-				to.Set(rv)
-			}
-		} else if from.Kind() == reflect.Ptr {
-			return set(to, from.Elem(), deepCopy)
-		} else {
-			return false
+		}
+		if from.Kind() == reflect.Ptr && from.IsNil() {
+			to.Set(reflect.Zero(to.Type()))
+			return true, nil
+		}
+		if _, ok := to.Addr().Interface().(sql.Scanner); !ok && (toKind == reflect.Struct || toKind == reflect.Map || toKind == reflect.Slice) {
+			return false, nil
 		}
 	}
 
-	return true
+	// try convert directly
+	if from.Type().ConvertibleTo(to.Type()) {
+		to.Set(from.Convert(to.Type()))
+		return true, nil
+	}
+
+	// try Scanner
+	if toScanner, ok := to.Addr().Interface().(sql.Scanner); ok {
+		// `from`  -> `to`
+		// *string -> sql.NullString
+		if from.Kind() == reflect.Ptr {
+			// if `from` is nil do nothing with `to`
+			if from.IsNil() {
+				return true, nil
+			}
+			// depointer `from`
+			from = indirect(from)
+		}
+		// `from` -> `to`
+		// string -> sql.NullString
+		// set `to` by invoking method Scan(`from`)
+		err := toScanner.Scan(from.Interface())
+		if err == nil {
+			return true, nil
+		}
+	}
+
+	// try Valuer
+	if fromValuer, ok := driverValuer(from); ok {
+		// `from`         -> `to`
+		// sql.NullString -> string
+		v, err := fromValuer.Value()
+		if err != nil {
+			return false, nil
+		}
+		// if `from` is not valid do nothing with `to`
+		if v == nil {
+			return true, nil
+		}
+		rv := reflect.ValueOf(v)
+		if rv.Type().AssignableTo(to.Type()) {
+			to.Set(rv)
+			return true, nil
+		}
+		if to.CanSet() && rv.Type().ConvertibleTo(to.Type()) {
+			to.Set(rv.Convert(to.Type()))
+			return true, nil
+		}
+		return false, nil
+	}
+
+	// from is ptr
+	if from.Kind() == reflect.Ptr {
+		return set(to, from.Elem(), deepCopy, converters)
+	}
+
+	return false, nil
+}
+
+// lookupAndCopyWithConverter looks up the type pair, on success the TypeConverter Fn func is called to copy src to dst field.
+func lookupAndCopyWithConverter(to, from reflect.Value, converters map[converterPair]TypeConverter) (copied bool, err error) {
+	pair := converterPair{
+		SrcType: from.Type(),
+		DstType: to.Type(),
+	}
+
+	if cnv, ok := converters[pair]; ok {
+		result, err := cnv.Fn(from.Interface())
+		if err != nil {
+			return false, err
+		}
+
+		if result != nil {
+			to.Set(reflect.ValueOf(result))
+		} else {
+			// in case we've got a nil value to copy
+			to.Set(reflect.Zero(to.Type()))
+		}
+
+		return true, nil
+	}
+
+	return false, nil
 }
 
 // parseTags Parses struct tags and returns uint8 bit flags.
@@ -472,11 +723,13 @@ func parseTags(tag string) (flg uint8, name string, err error) {
 			flg = flg | tagMust
 		case "nopanic":
 			flg = flg | tagNoPanic
+		case "override":
+			flg = flg | tagOverride
 		default:
 			if unicode.IsUpper([]rune(t)[0]) {
 				name = strings.TrimSpace(t)
 			} else {
-				err = errors.New("copier field name tag must be start upper case")
+				err = ErrFieldNameTagStartNotUpperCase
 			}
 		}
 	}
@@ -484,7 +737,7 @@ func parseTags(tag string) (flg uint8, name string, err error) {
 }
 
 // getTagFlags Parses struct tags for bit flags, field name.
-func getFlags(dest, src reflect.Value, toType, fromType reflect.Type) (flags, error) {
+func getFlags(dest, src reflect.Value, toType, fromType reflect.Type, opt Option) (flags, error) {
 	flgs := flags{
 		BitFlags: map[string]uint8{},
 		SrcNames: tagNameMapping{
@@ -496,6 +749,10 @@ func getFlags(dest, src reflect.Value, toType, fromType reflect.Type) (flags, er
 			TagToFieldName: map[string]string{},
 		},
 	}
+
+	mustOpt := opt.Must
+	noPanicOpt := opt.NoPanic
+
 	var toTypeFields, fromTypeFields []reflect.StructField
 	if dest.IsValid() {
 		toTypeFields = deepFields(toType)
@@ -517,6 +774,14 @@ func getFlags(dest, src reflect.Value, toType, fromType reflect.Type) (flags, er
 				flgs.DestNames.TagToFieldName[name] = field.Name
 			}
 		}
+
+		// Apply default flags
+		if mustOpt {
+			flgs.BitFlags[field.Name] = flgs.BitFlags[field.Name] | tagMust
+		}
+		if noPanicOpt {
+			flgs.BitFlags[field.Name] = flgs.BitFlags[field.Name] | tagNoPanic
+		}
 	}
 
 	// Get a list source of tags
@@ -525,6 +790,7 @@ func getFlags(dest, src reflect.Value, toType, fromType reflect.Type) (flags, er
 		if tags != "" {
 			var name string
 			var err error
+
 			if _, name, err = parseTags(tags); err != nil {
 				return flags{}, err
 			} else if name != "" {
@@ -533,6 +799,7 @@ func getFlags(dest, src reflect.Value, toType, fromType reflect.Type) (flags, er
 			}
 		}
 	}
+
 	return flgs, nil
 }
 
@@ -553,8 +820,14 @@ func checkBitFlags(flagsList map[string]uint8) (err error) {
 	return
 }
 
-func getFieldName(fieldName string, flgs flags) (srcFieldName string, destFieldName string) {
+func getFieldName(fieldName string, flgs flags, fieldNameMapping map[string]string) (srcFieldName string, destFieldName string) {
 	// get dest field name
+	if name, ok := fieldNameMapping[fieldName]; ok {
+		srcFieldName = fieldName
+		destFieldName = name
+		return
+	}
+
 	if srcTagName, ok := flgs.SrcNames.FieldNameToTag[fieldName]; ok {
 		destFieldName = srcTagName
 		if destTagName, ok := flgs.DestNames.TagToFieldName[srcTagName]; ok {
@@ -588,7 +861,6 @@ func getFieldName(fieldName string, flgs flags) (srcFieldName string, destFieldN
 }
 
 func driverValuer(v reflect.Value) (i driver.Valuer, ok bool) {
-
 	if !v.CanAddr() {
 		i, ok = v.Interface().(driver.Valuer)
 		return
@@ -596,4 +868,44 @@ func driverValuer(v reflect.Value) (i driver.Valuer, ok bool) {
 
 	i, ok = v.Addr().Interface().(driver.Valuer)
 	return
+}
+
+func fieldByName(v reflect.Value, name string, caseSensitive bool) reflect.Value {
+	if caseSensitive {
+		return v.FieldByName(name)
+	}
+
+	// For case-insensitive matching, prioritize exported fields
+	// First try exact match (might be the exported field)
+	if field := v.FieldByName(name); field.IsValid() {
+		return field
+	}
+
+	// If exact match fails, perform case-insensitive matching
+	// but prioritize exported fields while preserving promoted-field lookup.
+	var candidates []reflect.Value
+	var candidateFields []reflect.StructField
+
+	for _, fieldType := range reflect.VisibleFields(v.Type()) {
+		if strings.EqualFold(fieldType.Name, name) {
+			field := v.FieldByIndex(fieldType.Index)
+			candidates = append(candidates, field)
+			candidateFields = append(candidateFields, fieldType)
+		}
+	}
+
+	// If there are multiple candidate fields, prioritize exported ones
+	for i, candidate := range candidates {
+		if candidateFields[i].IsExported() {
+			return candidate
+		}
+	}
+
+	// If no exported field found, return the first match (preserve original behavior)
+	if len(candidates) > 0 {
+		return candidates[0]
+	}
+
+	// If no match found, return zero value
+	return reflect.Value{}
 }
